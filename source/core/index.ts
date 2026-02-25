@@ -169,6 +169,7 @@ const cacheableStore = new WeakableMap<string | StorageAdapter, CacheableRequest
 
 const redirectCodes: ReadonlySet<number> = new Set([300, 301, 302, 303, 304, 307, 308]);
 const transientWriteErrorCodes: ReadonlySet<string> = new Set(['EPIPE', 'ECONNRESET']);
+const transientWriteErrorGracePeriodInMilliseconds = 1000;
 
 // Track errors that have been processed by beforeError hooks to preserve custom error types
 const errorsProcessedByHooks = new WeakSet<Error>();
@@ -242,6 +243,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	private _uploadedSize = 0;
 	private readonly _pipedServerResponses = new Set<ServerResponse>();
 	private _request?: ClientRequest;
+	private readonly _requestsWithResponse = new WeakSet<ClientRequest>();
 	private _responseSize?: number;
 	private _bodySize?: number;
 	private _unproxyEvents = noop;
@@ -1278,9 +1280,50 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 
 		let lastRequestError: Error | undefined;
+		let pendingTransientWriteError: Error | undefined;
+		let pendingTransientWriteErrorTimeout: NodeJS.Timeout | undefined;
 		const responseEventName = options.cache ? 'cacheableResponse' : 'response';
+		const clearPendingTransientWriteError = (): void => {
+			if (pendingTransientWriteErrorTimeout) {
+				clearTimeout(pendingTransientWriteErrorTimeout);
+				pendingTransientWriteErrorTimeout = undefined;
+			}
+
+			pendingTransientWriteError = undefined;
+		};
+
+		const maybeEmitPendingTransientWriteError = (): void => {
+			if (!pendingTransientWriteError || pendingTransientWriteErrorTimeout) {
+				return;
+			}
+
+			if (this._isRequestSuperseded(request)) {
+				clearPendingTransientWriteError();
+				return;
+			}
+
+			pendingTransientWriteErrorTimeout = setTimeout(() => {
+				pendingTransientWriteErrorTimeout = undefined;
+
+				if (this._isRequestSuperseded(request)) {
+					pendingTransientWriteError = undefined;
+					return;
+				}
+
+				const error = pendingTransientWriteError;
+				pendingTransientWriteError = undefined;
+
+				if (!error) {
+					return;
+				}
+
+				emitRequestError(error);
+			}, transientWriteErrorGracePeriodInMilliseconds);
+		};
 
 		const responseHandler = (response: IncomingMessageWithTimings) => {
+			clearPendingTransientWriteError();
+			this._requestsWithResponse.add(request);
 			void this._onResponse(response);
 		};
 
@@ -1305,16 +1348,15 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			}
 
 			/*
-			Transient write errors (EPIPE, ECONNRESET) often fire during redirects when the server closes the connection after sending the redirect response. Defer by one microtask to let the response event make the request stale.
+			Transient write errors (EPIPE, ECONNRESET) can race with redirect response handling.
+			Give response/redirect bookkeeping a short grace window before deciding the error is fatal.
 			*/
 			if (isTransientWriteError(error)) {
-				queueMicrotask(() => {
-					if (this._isRequestStale(request)) {
-						return;
-					}
+				pendingTransientWriteError = error;
 
-					emitRequestError(error);
-				});
+				if (options.cache) {
+					maybeEmitPendingTransientWriteError();
+				}
 
 				return;
 			}
@@ -1324,15 +1366,24 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 		if (!options.cache) {
 			request.once('close', () => {
-				if (this._request !== request || this._requestHasResponse(request) || this._stopReading) {
+				const emitCloseError = () => {
+					if (this._request !== request || this._requestHasResponse(request) || this._stopReading) {
+						return;
+					}
+
+					this._beforeError(lastRequestError ?? new ReadError({
+						name: 'Error',
+						message: 'The server aborted pending request',
+						code: 'ECONNRESET',
+					}, this));
+				};
+
+				if (lastRequestError && isTransientWriteError(lastRequestError)) {
+					maybeEmitPendingTransientWriteError();
 					return;
 				}
 
-				this._beforeError(lastRequestError ?? new ReadError({
-					name: 'Error',
-					message: 'The server aborted pending request',
-					code: 'ECONNRESET',
-				}, this));
+				emitCloseError();
 			});
 		}
 
@@ -1347,7 +1398,11 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	}
 
 	private _requestHasResponse(request: ClientRequest): boolean {
-		return Boolean((request as ClientRequest & {res?: unknown}).res);
+		return this._requestsWithResponse.has(request) || Boolean((request as ClientRequest & {res?: unknown}).res);
+	}
+
+	private _isRequestSuperseded(request: ClientRequest): boolean {
+		return this._request !== request || this._requestHasResponse(request) || this._stopReading;
 	}
 
 	private _isRequestStale(request: ClientRequest): boolean {

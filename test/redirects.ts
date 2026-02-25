@@ -138,6 +138,43 @@ const injectWriteErrorAfterResponse = (request: ClientRequest, writeError: NodeJ
 	}) as typeof request.write;
 };
 
+/*
+Forces a transient write error and an early close on the original request immediately after its redirect response arrives. This reproduces a race where stale request errors can be surfaced before redirect bookkeeping marks the request as stale.
+*/
+const injectTransientWriteErrorAndEarlyCloseOnResponse = (request: ClientRequest, errorCode: 'EPIPE' | 'ECONNRESET', onInjected?: () => void): void => {
+	const transientError = new Error('forced transient write error') as NodeJS.ErrnoException;
+	transientError.code = errorCode;
+
+	request.once('response', () => {
+		onInjected?.();
+		request.emit('error', transientError);
+		request.emit('close');
+	});
+};
+
+const delayResponseEventAndInjectTransientError = (request: ClientRequest, errorCode: 'EPIPE' | 'ECONNRESET', responseDelayMilliseconds: number, onInjected?: () => void): void => {
+	const transientError = new Error('forced delayed-response transient write error') as NodeJS.ErrnoException;
+	transientError.code = errorCode;
+
+	const originalEmit = request.emit.bind(request);
+	let handledResponse = false;
+
+	request.emit = ((eventName: string | symbol, ...arguments_: any[]) => {
+		if (handledResponse || eventName !== 'response') {
+			return originalEmit(eventName, ...arguments_);
+		}
+
+		handledResponse = true;
+		onInjected?.();
+		originalEmit('error', transientError);
+		originalEmit('close');
+		setTimeout(() => {
+			originalEmit(eventName, ...arguments_);
+		}, responseDelayMilliseconds);
+		return true;
+	}) as typeof request.emit;
+};
+
 test('cannot redirect to UNIX protocol when UNIX sockets are enabled', withServer, async (t, server, got) => {
 	server.get('/protocol', unixProtocol);
 	server.get('/hostname', unixHostname);
@@ -972,6 +1009,76 @@ test('early 307 redirect does not emit stale original request write error', with
 		const {code} = error as NodeJS.ErrnoException;
 		return code === 'EPIPE' || code === 'ECONNRESET' || code === 'ECANCELED';
 	}));
+});
+
+test('early 307 redirect ignores transient write error when close is emitted before stale state is observed', withServer, async (t, server, got) => {
+	const requestBody = Buffer.alloc(1024 * 1024 * 2, 'm');
+	const requests: ClientRequest[] = [];
+	let injectedErrorAndClose = false;
+
+	server.post('/redirect-early-stale-close-race', early307RedirectHandler('/target-early-stale-close-race'));
+
+	server.post('/target-early-stale-close-race', async (request, response) => {
+		for await (const receivedChunk of request) {
+			void receivedChunk;
+		}
+
+		response.end('ok');
+	});
+
+	const {body} = await got.post('redirect-early-stale-close-race', {
+		body: requestBody,
+		retry: {
+			limit: 0,
+		},
+	}).on('request', request => {
+		requests.push(request);
+
+		if (requests.length === 1) {
+			injectTransientWriteErrorAndEarlyCloseOnResponse(request, 'EPIPE', () => {
+				injectedErrorAndClose = true;
+			});
+		}
+	});
+
+	t.is(body, 'ok');
+	t.is(requests.length, 2);
+	t.true(injectedErrorAndClose);
+});
+
+test('early 307 redirect ignores transient write error when response event is delayed behind close', withServer, async (t, server, got) => {
+	const requestBody = Buffer.alloc(1024 * 1024 * 2, 'n');
+	const requests: ClientRequest[] = [];
+	let injectedDelayedRace = false;
+
+	server.post('/redirect-early-delayed-response-race', early307RedirectHandler('/target-early-delayed-response-race'));
+
+	server.post('/target-early-delayed-response-race', async (request, response) => {
+		for await (const receivedChunk of request) {
+			void receivedChunk;
+		}
+
+		response.end('ok');
+	});
+
+	const {body} = await got.post('redirect-early-delayed-response-race', {
+		body: requestBody,
+		retry: {
+			limit: 0,
+		},
+	}).on('request', request => {
+		requests.push(request);
+
+		if (requests.length === 1) {
+			delayResponseEventAndInjectTransientError(request, 'EPIPE', 700, () => {
+				injectedDelayedRace = true;
+			});
+		}
+	});
+
+	t.is(body, 'ok');
+	t.is(requests.length, 2);
+	t.true(injectedDelayedRace);
 });
 
 const staleWriteErrorCases = [
